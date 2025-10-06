@@ -55,7 +55,7 @@ def conectar_con_reintentos(host, puerto):
     demora = 1.0
     while True:
         try:
-            s = socket.create_connection((host, puerto), timeout=10)
+            s = socket.create_connection((host, puerto))
             s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # baja latencia
             print(f"[cliente] Conectado a {host}:{puerto}")
             return s
