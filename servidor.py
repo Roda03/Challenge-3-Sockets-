@@ -1,140 +1,93 @@
-import socket
-import threading
-import signal
-import sys
-import time
+import socket             # biblioteca base para crear sockets TCP
+import threading          # permite manejar múltiples clientes a la vez usando hilos
 
-SERVER_IP = "127.0.0.1"   # usa "0.0.0.0" para aceptar desde otras PCs de la red
-SERVER_PORT = 8000
+clientes_conectados = []  # lista global con los sockets de todos los clientes conectados
 
-# Variables globales para control del servidor
-server_sock = None
-shutdown_event = threading.Event()
-active_connections = []
-
-def handle_client(client_socket: socket.socket, addr):
-    """
-    Atiende a un cliente en un hilo dedicado.
-    Protocolo:
-      1) Primer mensaje: 'username' (texto)
-      2) Mensajes libres; si recibe 'close' => responde 'closed' y cierra
-    """
-    # Registrar esta conexión
-    active_connections.append(client_socket)
-    
+def manejar_clientes(cliente_socket, cliente_direccion):
+    clientes_conectados.append(cliente_socket)  # registramos el nuevo cliente en la lista activa
     try:
-        # 1) Leer username
-        data = client_socket.recv(1024)
-        if not data:
-            return
-        username = data.decode("utf-8", errors="replace").strip() or f"{addr[0]}:{addr[1]}"
-        print(f"[+] {username} conectado desde {addr[0]}:{addr[1]}")
+        nombre = cliente_socket.recv(1024).decode('utf-8')  # handshake simple: el cliente envía su nombre
+        print(f"Nombre del cliente: {nombre}")              # log informativo en el servidor
+        cliente_socket.send(f"Hola, {nombre}, ¡bienvenido al servidor!".encode('utf-8'))  # saludo inicial
 
-        # Opcional: ACK del nombre
-        client_socket.sendall(b"accepted")
-
-        # 2) Loop de mensajes
-        while not shutdown_event.is_set():
-            # Usar timeout para verificar periódicamente si debemos cerrar
-            client_socket.settimeout(1.0)
+        while True:  # bucle principal de atención a este cliente
             try:
-                data = client_socket.recv(1024)
+                data = cliente_socket.recv(1024)  # leer bytes del socket del cliente
+
+                # ⬇️ CASO 1: el cliente cerró la conexión ordenadamente → recv() retorna b''
                 if not data:
-                    # Cliente cerró su lado de la conexión
-                    break
+                    print(f"📤 {nombre} se desconectó (cierre de socket)")  # log de salida por cierre normal
+                    # avisar a los demás clientes que este usuario salió
+                    for c in clientes_conectados[:]:  # iteramos sobre una copia para poder remover seguros
+                        if c is not cliente_socket:
+                            try:
+                                c.send(f"📤 {nombre} salió del chat".encode('utf-8'))  # broadcast de salida
+                            except:
+                                try: c.close(); clientes_conectados.remove(c)
+                                except: pass
+                    break  # salimos del bucle de este cliente
 
-                msg = data.decode("utf-8", errors="replace").strip()
+                mensaje_cliente = data.decode('utf-8').strip()  # decodificamos y limpiamos \r\n y espacios
+                if not mensaje_cliente:
+                    continue  # descartamos líneas vacías para evitar imprimir "nombre:" sin contenido
 
-                if msg.lower() == "close":
-                    client_socket.sendall(b"closed")
-                    break
+                # si el cliente envía la palabra clave de cierre, registramos y salimos
+                if mensaje_cliente.lower() == "close":
+                    print(f"📤 {nombre} se desconectó (close)")  # log de salida voluntaria
+                    # avisar a los demás clientes que este usuario salió
+                    for c in clientes_conectados[:]:
+                        if c is not cliente_socket:
+                            try:
+                                c.send(f"📤 {nombre} salió del chat".encode('utf-8'))  # broadcast de salida
+                            except:
+                                try: c.close(); clientes_conectados.remove(c)
+                                except: pass
+                    break  # salimos del bucle de este cliente
 
-                print(f"{username}: {msg}")
-                client_socket.sendall(b"accepted")
-            except socket.timeout:
-                # Timeout para verificar si debemos cerrar
-                continue
-            except Exception as e:
-                if not shutdown_event.is_set():
-                    print(f"[!] Error con {addr}: {e}")
+                # reenviamos el mensaje a todos menos al emisor para lograr el efecto broadcast
+                for c in clientes_conectados[:]:
+                    if c is not cliente_socket:
+                        try:
+                            c.send(f"{nombre}: {mensaje_cliente}".encode('utf-8'))  # formato nombre: mensaje
+                        except:
+                            # si un envío falla, cerramos y limpiamos ese socket de la lista activa
+                            try: c.close(); clientes_conectados.remove(c)
+                            except: pass
+
+                print(f"{nombre}: {mensaje_cliente}")  # log del mensaje recibido en la consola del servidor
+
+            # ⬇️ CASO 2: corte brusco de la conexión por parte del cliente
+            except ConnectionResetError:
+                print(f"⚠️ {nombre} se desconectó abruptamente (reset)")  # conexión reseteada por el peer
                 break
-    except Exception as e:
-        if not shutdown_event.is_set():
-            print(f"[!] Error con {addr}: {e}")
+            except Exception as e:
+                print(f"Error con cliente {nombre}: {e}")  # cualquier otro error en el manejo de este cliente
+                break
     finally:
-        # Remover de conexiones activas y cerrar
-        if client_socket in active_connections:
-            active_connections.remove(client_socket)
-        try:
-            client_socket.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        client_socket.close()
-        if not shutdown_event.is_set():
-            print(f"[-] Conexión cerrada: {addr[0]}:{addr[1]}")
+        # limpieza final: remover el socket del cliente de la lista y cerrarlo
+        if cliente_socket in clientes_conectados:
+            clientes_conectados.remove(cliente_socket)  # mantenemos la lista de clientes consistente
+        try: cliente_socket.close()  # liberamos el recurso del socket del cliente
+        except: pass
 
-def run_server():
-    global server_sock
-    server_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    # Reusar puerto rápidamente tras reinicio
-    server_sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
-    server_sock.bind((SERVER_IP, SERVER_PORT))
-    server_sock.listen(128)  # backlog razonable
-    print(f"Servidor escuchando en {SERVER_IP}:{SERVER_PORT} (Ctrl+C para detener)")
-
-    while not shutdown_event.is_set():
-        try:
-            # Usar timeout para poder verificar shutdown_event periódicamente
-            server_sock.settimeout(1.0)
-            client_socket, addr = server_sock.accept()
-            
-            # Hilo por cliente (no daemon para permitir cierre limpio)
-            t = threading.Thread(target=handle_client, args=(client_socket, addr))
-            t.start()
-            
-        except socket.timeout:
-            # Timeout normal, verificar si debemos cerrar
-            continue
-        except OSError as e:
-            if not shutdown_event.is_set():
-                print(f"[!] Error aceptando conexión: {e}")
-            break
-
-def stop_server(sig, frame):
-    print("\nDeteniendo servidor...")
-    shutdown_event.set()
+def abrir_servidor():  # configura y arranca el servidor TCP
+    servidor_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)  # socket IPv4 + TCP
     
-    # Cerrar socket del servidor
-    if server_sock is not None:
-        try:
-            server_sock.close()
-        except Exception:
-            pass
+    ip_servidor = "127.0.0.1"  # dirección IP donde escuchará el servidor
+    puerto_servidor = 8000     # puerto TCP de escucha
     
-    # Cerrar todas las conexiones activas
-    print("Cerrando conexiones activas...")
-    for conn in active_connections[:]:
-        try:
-            conn.shutdown(socket.SHUT_RDWR)
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
+    servidor_socket.bind((ip_servidor, puerto_servidor))  # liga IP y puerto al socket del servidor
+    servidor_socket.listen(5)                             # pone el socket en modo escucha con backlog de 5
+    print(f"Servidor escuchando en {ip_servidor}:{puerto_servidor}")  # mensaje informativo de arranque
     
-    print("Servidor detenido correctamente")
-    sys.exit(0)
+    while True:  # bucle de aceptación de nuevos clientes
+        cliente_socket, direccion_cliente = servidor_socket.accept()  # bloqueo hasta que llegue una conexión
+        # creamos un hilo dedicado para atender a este nuevo cliente sin bloquear a los demás
+        hilo_cliente = threading.Thread(
+            target=manejar_clientes,                # función que gestionará al cliente
+            args=(cliente_socket, direccion_cliente)  # pasamos el socket y la dirección del cliente
+        )
+        hilo_cliente.start()  # iniciamos el hilo para atención concurrente
 
-if __name__ == "__main__":
-    # Captura Ctrl+C para cierre ordenado
-    signal.signal(signal.SIGINT, stop_server)
-    
-    try:
-        run_server()
-    except KeyboardInterrupt:
-        stop_server(None, None)
-    except Exception as e:
-        print(f"Error inesperado: {e}")
-        stop_server(None, None)
+abrir_servidor()  # punto de entrada del servidor
